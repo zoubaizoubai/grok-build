@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "grok_build",
+  "project_id": "41e9433b-016a-4030-bb57-33891237c8b0"
+}
