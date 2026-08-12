@@ -390,6 +390,11 @@ fn finalize_image_describe_sampler_none_uses_active_session_model_not_forced_hel
     assert_eq!(model, "composer-session-model");
     assert_eq!(cfg.model, "composer-session-model");
     assert_ne!(cfg.model, "grok-build");
+    assert_eq!(
+        cfg.temperature,
+        Some(crate::session::image_describe::IMAGE_DESCRIBE_DEFAULT_TEMPERATURE),
+        "unset model temperature falls back to image-describe default"
+    );
 }
 #[test]
 fn finalize_image_describe_sampler_some_stamps_session_fields() {
@@ -407,6 +412,35 @@ fn finalize_image_describe_sampler_some_stamps_session_fields() {
     assert_eq!(cfg.model, "grok-build");
     assert_eq!(cfg.client_identifier.as_deref(), Some("cli"));
     assert_eq!(cfg.max_retries, Some(7));
+    assert_eq!(
+        cfg.temperature,
+        Some(crate::session::image_describe::IMAGE_DESCRIBE_DEFAULT_TEMPERATURE)
+    );
+}
+#[test]
+fn finalize_image_describe_sampler_preserves_model_configured_temperature() {
+    let active = SamplerConfig {
+        model: "composer-session-model".into(),
+        temperature: Some(0.9),
+        ..Default::default()
+    };
+    let aux = SamplerConfig {
+        model: "kimi-k3".into(),
+        temperature: Some(1.0),
+        ..Default::default()
+    };
+    let (_, cfg) = finalize_image_describe_sampler_config(Some(aux), &active, None, None);
+    assert_eq!(
+        cfg.temperature,
+        Some(1.0),
+        "per-model temperature must win over the image-describe default"
+    );
+    let (_, cfg_none) = finalize_image_describe_sampler_config(None, &active, None, None);
+    assert_eq!(
+        cfg_none.temperature,
+        Some(0.9),
+        "session model temperature is kept when no aux model is resolved"
+    );
 }
 #[test]
 fn resolve_aux_model_honors_grok_build_override() {
@@ -1063,6 +1097,7 @@ fn test_model_entry(
             supports_reasoning_effort: false,
             reasoning_efforts: Vec::new(),
             supports_backend_search: false,
+            accepts_images: true,
             compactions_remaining: None,
             compaction_at_tokens: None,
             show_model_fingerprint: false,
@@ -2107,6 +2142,45 @@ fn model_use_concise_defaults_to_false() {
     assert!(!model.info.use_concise);
 }
 #[test]
+fn model_accepts_images_honors_explicit_config() {
+    let raw_config: toml::Value = toml::from_str(
+        r#"
+            [model.text-only]
+            model = "deepseek-chat"
+            base_url = "https://api.deepseek.com/v1"
+            context_window = 128000
+            accepts_images = false
+
+            [model.legacy-vision-default]
+            model = "legacy-vision"
+            base_url = "https://example.com/v1"
+            context_window = 128000
+            "#,
+    )
+    .unwrap();
+    let cfg = Config::new_from_toml_cfg(&raw_config).expect("config should parse");
+    let resolved = resolve_model_list(&cfg, None);
+    assert!(!resolved["text-only"].info.accepts_images);
+    assert!(resolved["legacy-vision-default"].info.accepts_images);
+}
+#[test]
+fn acp_model_meta_exposes_image_capability() {
+    let mut models = IndexMap::new();
+    let mut entry = test_model_entry("deepseek-chat", "https://test.api/v1", None, None, None);
+    entry.info.accepts_images = false;
+    models.insert("text-only".to_string(), entry);
+
+    let acp_models = to_acp_model_info(&models);
+    let meta = acp_models
+        .values()
+        .next()
+        .expect("model info")
+        .meta
+        .as_ref()
+        .expect("model metadata");
+    assert_eq!(meta["acceptsImages"], false);
+}
+#[test]
 fn model_info_from_config_propagates_use_concise() {
     let entry = ModelEntryConfig {
         id: None,
@@ -2137,6 +2211,7 @@ fn model_info_from_config_propagates_use_concise() {
         supports_reasoning_effort: false,
         reasoning_efforts: Vec::new(),
         supports_backend_search: false,
+        accepts_images: true,
         compactions_remaining: None,
         compaction_at_tokens: None,
         show_model_fingerprint: false,
@@ -2297,6 +2372,7 @@ fn model_info_from_config_propagates_agent_type() {
         supports_reasoning_effort: false,
         reasoning_efforts: Vec::new(),
         supports_backend_search: false,
+        accepts_images: true,
         compactions_remaining: None,
         compaction_at_tokens: None,
         show_model_fingerprint: false,
@@ -2749,6 +2825,7 @@ fn inference_idle_timeout_propagates_to_model_info() {
         supports_reasoning_effort: false,
         reasoning_efforts: Vec::new(),
         supports_backend_search: false,
+        accepts_images: true,
         compactions_remaining: None,
         compaction_at_tokens: None,
         show_model_fingerprint: false,
@@ -6723,6 +6800,7 @@ fn prefetch_model_entry(slug: &str, context_window: u64, api_backend: ApiBackend
             supports_reasoning_effort: false,
             reasoning_efforts: Vec::new(),
             supports_backend_search: false,
+            accepts_images: true,
             compactions_remaining: None,
             compaction_at_tokens: None,
             show_model_fingerprint: false,

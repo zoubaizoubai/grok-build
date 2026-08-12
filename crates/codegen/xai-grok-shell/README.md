@@ -1820,11 +1820,22 @@ temperature = 0.7                     # Sampling temperature (0.0-2.0)
 top_p = 0.95                          # Nucleus sampling parameter
 max_completion_tokens = 8192          # Max tokens per response
 context_window = 256000               # Total context window in tokens (for auto-compact)
+accepts_images = false                # Route pasted images through the configured vision helper
 ```
 
 **Credential resolution order:** `api_key` → `env_key` → cached `auth_provider` token (terminal: a cache miss resolves to no credential, never the session token) → session token → `XAI_API_KEY`. See [Per-Model Auth Providers](#per-model-auth-providers).
 
 The `context_window` parameter is used to calculate when auto-compact should trigger. If not specified, Grok falls back to built-in defaults for known models.
+
+`accepts_images` defaults to `true` for backward compatibility. Set it to `false` for a text-only main model and configure `[models].image_description` to point at a vision-capable model with its own credentials. Current-turn user and interjection images are then persisted and described before the main request, so the text-only model receives `<image_description>` and `<image_files>` text but no user `image_url` parts.
+
+Failure policy:
+
+- **Turn-start user images**: if the vision helper fails, the turn is aborted (images are never silently dropped).
+- **Mid-turn interjections**: helper failure is soft — the interjection text is kept with a drop notice, and the running turn continues.
+- **Tool results** (`read_file` images/PDF pages, extracted base64): when `accepts_images = false`, structural image parts are not attached; the model gets path/text notes only.
+
+When a session already contains structural images (user attachments or tool-result images) from a vision model, switching to a text-only model is allowed, but the next sample is blocked with `TEXT_MODEL_HISTORY_CONTAINS_IMAGES`. Switch back to a vision model or start `/new`.
 
 ### Overriding Built-in Models
 

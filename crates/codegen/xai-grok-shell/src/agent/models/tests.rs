@@ -626,6 +626,24 @@ fn reasoning_effort_helpers_resolve_wire_name_to_catalog_key() {
 }
 
 #[test]
+fn model_accepts_images_resolves_key_slug_and_unknown_default() {
+    let mgr = test_manager();
+    let mut text_only = ModelEntry {
+        info: config::ModelInfo::fallback("text-only-slug"),
+        api_key: None,
+        env_key: None,
+        auth_provider: None,
+        api_base_url: None,
+    };
+    text_only.info.accepts_images = false;
+    mgr.insert_test_entry("text-only-key", text_only);
+
+    assert!(!mgr.model_accepts_images("text-only-key"));
+    assert!(!mgr.model_accepts_images("text-only-slug"));
+    assert!(mgr.model_accepts_images("unknown-model"));
+}
+
+#[test]
 fn default_model_honors_allowlist_when_no_default_set() {
     let cfg = config_from_toml(
         r#"
@@ -2046,6 +2064,7 @@ fn make_entry_config_with_id(
         supports_reasoning_effort: false,
         reasoning_efforts: Vec::new(),
         supports_backend_search: false,
+        accepts_images: true,
         compactions_remaining: None,
         compaction_at_tokens: None,
         show_model_fingerprint: false,

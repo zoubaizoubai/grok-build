@@ -663,39 +663,45 @@ impl SessionActor {
         } else {
             query
         };
-        let user_images = self
-            .normalize_images_with_notices(&mut context, raw_images, is_cursor)
+        let image_policy = self.image_input_policy().await;
+        let mut user_images = self
+            .normalize_images_with_notices(
+                &mut context,
+                raw_images,
+                image_policy.normalizes_strictly(),
+            )
             .await;
-        let (query, extra_images) = if !self.is_cursor_harness() {
-            let extraction = xai_grok_tools::util::base64_images::extract_base64_images(query);
-            if extraction.images.is_empty() {
-                (extraction.text, Vec::new())
-            } else {
-                let cleaned_text = extraction.text;
-                let count = extraction.images.len();
-                tracing::info!(
-                    session_id = %self.session_info.id,
-                    count,
-                    "base64 images extracted from user query",
-                );
-                let acp_imgs: Vec<agent_client_protocol::ImageContent> = extraction
-                    .images
-                    .into_iter()
-                    .map(|img| agent_client_protocol::ImageContent::new(img.data, img.mime_type))
-                    .collect();
-                let nr = crate::session::image_normalize::normalize_images(acp_imgs, false).await;
-                if !nr.re_encode_fallbacks.is_empty() {
-                    tracing::warn!(
-                        session_id = %self.session_info.id,
-                        notes = %nr.re_encode_fallbacks.join(" "),
-                        "Extracted user query image kept original after re-encode failure",
-                    );
-                }
-                (cleaned_text, nr.images)
-            }
+        let extraction = xai_grok_tools::util::base64_images::extract_base64_images(query);
+        let (query, extra_images) = if extraction.images.is_empty() {
+            (extraction.text, Vec::new())
         } else {
-            (query, Vec::new())
+            let cleaned_text = extraction.text;
+            let count = extraction.images.len();
+            tracing::info!(
+                session_id = %self.session_info.id,
+                count,
+                "base64 images extracted from user query",
+            );
+            let acp_imgs: Vec<agent_client_protocol::ImageContent> = extraction
+                .images
+                .into_iter()
+                .map(|img| agent_client_protocol::ImageContent::new(img.data, img.mime_type))
+                .collect();
+            let nr = crate::session::image_normalize::normalize_images(
+                acp_imgs,
+                image_policy.normalizes_strictly(),
+            )
+            .await;
+            if !nr.re_encode_fallbacks.is_empty() {
+                tracing::warn!(
+                    session_id = %self.session_info.id,
+                    notes = %nr.re_encode_fallbacks.join(" "),
+                    "Extracted user query image kept original after re-encode failure",
+                );
+            }
+            (cleaned_text, nr.images)
         };
+        user_images.extend(extra_images);
         let assembled = crate::session::prompt_parser::ParsedPrompt::assemble_parts_with_skills(
             &context,
             &query,
@@ -771,33 +777,39 @@ impl SessionActor {
         self.inject_workflow_status_reminder().await;
         let user_message = if user_images.is_empty() {
             user_message
-        } else if self.is_cursor_harness() {
-            self.transcribe_user_images(user_message, &user_images)
-                .await?
         } else {
-            let session_dir = crate::session::persistence::ensure_owner_only_session_dir(
-                &crate::session::info::Info {
-                    id: self.session_info.id.clone(),
-                    cwd: self.session_info.cwd.clone(),
-                },
-            )
-            .map_err(|e| {
-                acp::Error::internal_error().data(format!("failed to create session dir: {e}"))
-            })?;
-            crate::session::image_describe::persist_and_prepend_image_files(
-                &session_dir,
-                &user_images,
-                &user_message,
-            )
-            .map_err(|e| {
-                acp::Error::internal_error()
-                    .data(format!("failed to save user images to assets dir: {e}"))
-            })?
+            match image_policy {
+                crate::session::image_input_policy::ImageInputPolicy::Transcribe => {
+                    self.transcribe_user_images(user_message, &user_images)
+                        .await?
+                }
+                crate::session::image_input_policy::ImageInputPolicy::PassThrough => {
+                    let session_dir = crate::session::persistence::ensure_owner_only_session_dir(
+                        &crate::session::info::Info {
+                            id: self.session_info.id.clone(),
+                            cwd: self.session_info.cwd.clone(),
+                        },
+                    )
+                    .map_err(|e| {
+                        acp::Error::internal_error()
+                            .data(format!("failed to create session dir: {e}"))
+                    })?;
+                    crate::session::image_describe::persist_and_prepend_image_files(
+                        &session_dir,
+                        &user_images,
+                        &user_message,
+                    )
+                    .map_err(|e| {
+                        acp::Error::internal_error()
+                            .data(format!("failed to save user images to assets dir: {e}"))
+                    })?
+                }
+            }
         };
-        let attached_image_refs = if self.is_cursor_harness() {
-            Vec::new()
-        } else {
+        let attached_image_refs = if image_policy.attaches_images() {
             crate::session::placeholder_images::attached_image_references(&user_images)
+        } else {
+            Vec::new()
         };
         self.tool_bridge_handle()
             .update_resource(xai_grok_tools::types::resources::AttachedImages(
@@ -847,12 +859,9 @@ impl SessionActor {
                 }
             };
             user_chat.set_prompt_index(current_prompt_index);
-            if !self.is_cursor_harness() {
+            if image_policy.attaches_images() {
                 for image in &user_images {
                     user_chat.add_image(pick_user_image_url(image));
-                }
-                for image in &extra_images {
-                    user_chat.add_image(format!("data:{};base64,{}", image.mime_type, image.data));
                 }
             }
             if let Some(ack) = persist_ack {
@@ -2315,6 +2324,25 @@ impl SessionActor {
                 })),
             );
             let mut request = request;
+            // Use the catalog model id (via image_input_policy), not
+            // request.model (API wire name). Multiple [model.*] entries can
+            // share the same API model string with different accepts_images.
+            let catalog_model = self.current_model_id().await;
+            let request_policy = self.image_input_policy().await;
+            if let Err(error) = crate::session::image_input_policy::reject_text_model_image_history(
+                request_policy,
+                &catalog_model,
+                &request.items,
+            ) {
+                let data = serde_json::to_value(error).unwrap_or_else(|serialization_error| {
+                    serde_json::json!({
+                        "code": crate::session::image_input_policy::TEXT_MODEL_HISTORY_IMAGES_CODE,
+                        "model": catalog_model,
+                        "error": serialization_error.to_string(),
+                    })
+                });
+                return Err(acp::Error::invalid_params().data(data));
+            }
             request.x_grok_session_id = Some(self.session_info.id.to_string());
             request.x_grok_turn_idx =
                 Some(self.chat_state_handle.get_prompt_index().await.to_string());

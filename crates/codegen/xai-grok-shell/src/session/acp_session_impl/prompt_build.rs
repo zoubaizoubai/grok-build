@@ -513,6 +513,15 @@ pub(super) fn write_offload_and_build(
     }
 }
 impl SessionActor {
+    pub(super) async fn image_input_policy(
+        &self,
+    ) -> crate::session::image_input_policy::ImageInputPolicy {
+        let model = self.current_model_id().await;
+        crate::session::image_input_policy::ImageInputPolicy::from_accepts_images(
+            self.models_manager.model_accepts_images(&model),
+        )
+    }
+
     /// Rewrite the user-message prefix at conversation index 1.
     /// Caller must guarantee zero turns. When `drop_startup_skill_reminder`
     /// is true, also strips the synthetic `<system-reminder>` user item.

@@ -117,11 +117,11 @@ impl SessionActor {
         }
         count
     }
-    /// Normalize interjection images for injection (shared pipeline above);
-    /// notices append to `wrapped` (TEXT side only). Returns the images to
-    /// attach structurally. Sessions whose template rejects inline images
-    /// instead transcribe normalized survivors into the text via the existing
-    /// describe pipeline, or drop them with a notice.
+    /// Normalize / describe interjection images for injection.
+    ///
+    /// On Transcribe, helper failures are **soft**: the turn continues with
+    /// text-only content and a notice that images were dropped. Aborting the
+    /// whole mid-turn drain would be too harsh for a best-effort interjection.
     async fn prepare_interjection_images(
         &self,
         wrapped: &mut String,
@@ -130,26 +130,31 @@ impl SessionActor {
         if images.is_empty() {
             return images;
         }
-        let is_cursor = self.is_cursor_harness();
+        let image_policy = self.image_input_policy().await;
         let images = self
-            .normalize_images_with_notices(wrapped, images, is_cursor)
+            .normalize_images_with_notices(wrapped, images, image_policy.normalizes_strictly())
             .await;
-        if !is_cursor {
-            return images;
-        }
-        if !images.is_empty() {
-            match self.transcribe_user_images(wrapped.clone(), &images).await {
-                Ok(new_text) => *wrapped = new_text,
-                Err(e) => {
-                    tracing::warn!(?e, "interjection image processing failed; dropping images");
-                    wrapped.push_str(
-                        "\n\n[Note: the user attached image(s) to this message, but they could \
-                         not be processed in this session and were dropped.]",
-                    );
+        match image_policy {
+            crate::session::image_input_policy::ImageInputPolicy::PassThrough => images,
+            crate::session::image_input_policy::ImageInputPolicy::Transcribe => {
+                if !images.is_empty() {
+                    match self.transcribe_user_images(wrapped.clone(), &images).await {
+                        Ok(new_text) => *wrapped = new_text,
+                        Err(e) => {
+                            tracing::warn!(
+                                ?e,
+                                "interjection image processing failed; dropping images"
+                            );
+                            wrapped.push_str(
+                                "\n\n[Note: the user attached image(s) to this message, but they could \
+                                 not be processed in this session and were dropped.]",
+                            );
+                        }
+                    }
                 }
+                Vec::new()
             }
         }
-        Vec::new()
     }
 
     /// Broadcast a mid-turn interjection to every attached client.
@@ -313,13 +318,25 @@ impl SessionActor {
             return false;
         }
 
-        for PendingInterjection { text, attachments } in entries {
+        for PendingInterjection {
+            text,
+            mut attachments,
+        } in entries
+        {
             // Sanitizer drops `[Image #N: <path>]` → `[Image #N]` before the
             // text reaches the model, covering legacy-client raw text AND the
             // queue-interject harvest. Wrapping and truncation stay in the
             // shared crate (`format_interjection`).
             let sanitized =
                 crate::session::placeholder_images::strip_paths_from_image_placeholders(text);
+            let extraction = xai_grok_tools::util::base64_images::extract_base64_images(sanitized);
+            attachments.extend(
+                extraction
+                    .images
+                    .into_iter()
+                    .map(|image| acp::ImageContent::new(image.data, image.mime_type)),
+            );
+            let sanitized = extraction.text;
             let skill_information = self.interjection_skill_information(&sanitized).await;
             let mut wrapped = format_interjection(sanitized);
             let images = self

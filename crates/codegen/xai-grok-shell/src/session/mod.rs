@@ -395,6 +395,7 @@ pub(crate) mod goal_summarizer;
 pub mod goal_tracker;
 pub mod helpers;
 pub(crate) mod image_describe;
+pub(crate) mod image_input_policy;
 pub(crate) mod image_normalize;
 pub(crate) mod inference_metrics;
 pub use xai_grok_shared::session::info;

@@ -2442,7 +2442,12 @@ impl SessionActor {
             result.prompt_text
         };
         let mut inline_images: Vec<ContentPart> = Vec::new();
-        let extraction = if !self.is_cursor_harness()
+        // Layer accepts_images on top of the existing cursor-harness gate so
+        // text-only BYOK models never receive structural tool images. Cursor
+        // harness behaviour is unchanged when accepts_images is true.
+        let image_policy = self.image_input_policy().await;
+        let may_inline_tool_images = !self.is_cursor_harness() && image_policy.attaches_images();
+        let extraction = if may_inline_tool_images
             && !matches!(
                 result.output,
                 ToolsToolOutput::ReadFile(ReadFileOutput::ImageContent(_))
@@ -2461,6 +2466,11 @@ impl SessionActor {
             &mut extracted_images,
             tool_layer_images,
         );
+        if !image_policy.attaches_images() {
+            // Text-only main model: drop tool-layer / extracted images as
+            // structure; keep path text so the agent can still reason.
+            extracted_images.clear();
+        }
         let mut prompt_text = maybe_rewrite(path_rewriter.as_ref(), extraction.text);
         if !self.is_cursor_harness()
             && let ToolsToolOutput::ReadFile(ReadFileOutput::ImageContent(ref image_content)) =
@@ -2483,7 +2493,7 @@ impl SessionActor {
                         "[Image from {path} was not attached: invalid or unreadable image data]"
                     );
                 }
-                InlineAttachVerdict::Attach => {
+                InlineAttachVerdict::Attach if may_inline_tool_images => {
                     let url = format!(
                         "data:{};base64,{}",
                         image_content.mime_type, image_content.data
@@ -2493,27 +2503,41 @@ impl SessionActor {
                     });
                     prompt_text = format!("Read image file: {path}");
                 }
+                InlineAttachVerdict::Attach => {
+                    // Text-only model: keep a path note, no image_url parts.
+                    prompt_text = format!(
+                        "Read image file: {path}\n[Note: image bytes were not attached because the current model does not accept images. Switch to a vision model to view the image, or describe it via a vision helper.]"
+                    );
+                }
             }
         }
         if !self.is_cursor_harness()
             && let ToolsToolOutput::ReadFile(ReadFileOutput::PdfPageImages(ref pdf)) = result.output
         {
-            for page in &pdf.pages {
-                let url = format!("data:{};base64,{}", page.mime_type, page.data);
-                inline_images.push(ContentPart::Image {
-                    url: std::sync::Arc::<str>::from(url),
-                });
-            }
             let path = tool_parsed_args
                 .get("target_file")
                 .or_else(|| tool_parsed_args.get("path"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
-            prompt_text = format!(
-                "Read PDF file: {path} ({} pages rendered, {} total)",
-                pdf.pages.len(),
-                pdf.total_pages,
-            );
+            if may_inline_tool_images {
+                for page in &pdf.pages {
+                    let url = format!("data:{};base64,{}", page.mime_type, page.data);
+                    inline_images.push(ContentPart::Image {
+                        url: std::sync::Arc::<str>::from(url),
+                    });
+                }
+                prompt_text = format!(
+                    "Read PDF file: {path} ({} pages rendered, {} total)",
+                    pdf.pages.len(),
+                    pdf.total_pages,
+                );
+            } else {
+                prompt_text = format!(
+                    "Read PDF file: {path} ({} pages rendered, {} total)\n[Note: page images were not attached because the current model does not accept images. Switch to a vision model to view the pages.]",
+                    pdf.pages.len(),
+                    pdf.total_pages,
+                );
+            }
         }
         let tool_chat = if inline_images.is_empty() {
             ConversationItem::tool_result(call_id.to_string(), prompt_text)
@@ -2526,7 +2550,7 @@ impl SessionActor {
         };
         self.chat_state_handle.push_tool_result(tool_chat);
         let mut deferred_followups = Vec::new();
-        if !extracted_images.is_empty() {
+        if may_inline_tool_images && !extracted_images.is_empty() {
             let count = extracted_images.len();
             tracing::info!(
                 session_id = %self.session_info.id,

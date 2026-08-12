@@ -588,6 +588,13 @@ impl ModelsManager {
             .unwrap_or(false)
     }
 
+    pub(crate) fn model_accepts_images(&self, model_id: &str) -> bool {
+        let catalog = self.inner.catalog.read();
+        config::find_model_by_id(&catalog.models, model_id)
+            .map(|entry| entry.info().accepts_images)
+            .unwrap_or(true)
+    }
+
     pub(crate) fn model_compactions_remaining(
         &self,
         model_id: &str,

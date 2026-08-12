@@ -154,6 +154,106 @@ async fn drain_interjection_with_images_attaches_image_parts() {
         .await;
 }
 
+#[tokio::test]
+async fn text_model_interjection_is_described_without_image_history() {
+    use axum::extract::State;
+    use axum::response::sse::{Event, Sse};
+    use axum::routing::post;
+    use futures::stream;
+
+    let requests = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+    let app = axum::Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(
+                |State(requests): State<Arc<std::sync::Mutex<Vec<serde_json::Value>>>>,
+                 axum::Json(body): axum::Json<serde_json::Value>| async move {
+                    requests.lock().unwrap().push(body);
+                    Sse::new(stream::iter([
+                        Ok::<_, std::convert::Infallible>(
+                            Event::default().data(
+                                serde_json::json!({
+                                    "id": "chatcmpl-interjection-image",
+                                    "object": "chat.completion.chunk",
+                                    "created": 1,
+                                    "model": "test-model",
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {
+                                            "role": "assistant",
+                                            "content": "A brown square."
+                                        },
+                                        "finish_reason": "stop"
+                                    }]
+                                })
+                                .to_string(),
+                            ),
+                        ),
+                        Ok(Event::default().data("[DONE]")),
+                    ]))
+                },
+            ),
+        )
+        .with_state(requests.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (actor, _gateway_rx) = build_actor().await;
+            for (key, model, accepts_images) in
+                [("test", "test", false), ("test-model", "test-model", true)]
+            {
+                let mut info = crate::agent::config::ModelInfo::fallback(model);
+                info.base_url.clone_from(&base_url);
+                info.api_backend = xai_grok_sampling_types::ApiBackend::ChatCompletions;
+                info.accepts_images = accepts_images;
+                actor.models_manager.insert_test_entry(
+                    key,
+                    crate::agent::config::ModelEntry {
+                        info,
+                        api_key: Some("test-key".into()),
+                        env_key: None,
+                        auth_provider: None,
+                        api_base_url: None,
+                    },
+                );
+            }
+            let mut sampling = actor.chat_state_handle.get_sampling_config().await.unwrap();
+            sampling.base_url.clone_from(&base_url);
+            sampling.api_backend = xai_grok_sampling_types::ApiBackend::ChatCompletions;
+            actor.chat_state_handle.update_sampling_config(sampling);
+            actor.pending_interjections.push(PendingInterjection {
+                text: "what is this?".into(),
+                attachments: vec![test_image_content()],
+            });
+
+            assert!(actor.drain_pending_interjections().await);
+            let conversation = actor.chat_state_handle.get_conversation().await;
+            let tail = conversation.last().expect("synthetic user item");
+            assert!(tail.text_content().contains("<image_description>"));
+            assert!(tail.text_content().contains("A brown square."));
+            assert!(tail.text_content().contains("<image_files>"));
+            let ConversationItem::User(user) = tail else {
+                panic!("interjection tail must be a user item");
+            };
+            assert!(
+                !user
+                    .content
+                    .iter()
+                    .any(|part| matches!(part, xai_grok_sampling_types::ContentPart::Image { .. })),
+                "text-only model history must not contain a user image part"
+            );
+        })
+        .await;
+    server.abort();
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].to_string().contains("image_url"));
+}
+
 /// The drain strips `[Image #N: <path>]` → `[Image #N]` before the text
 /// reaches the model — same gate as the prompt path. Covers raw text from
 /// legacy clients AND the queue-interject harvest (raw `queue_meta.text`).

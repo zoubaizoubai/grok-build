@@ -42,6 +42,13 @@ pub(crate) const CURRENT_QUERY_CAP: usize = 12_000;
 /// **last** N images are described; older ones receive
 /// [`SKIPPED_IMAGE_MARKER`]. Default 16.
 pub(crate) const IMAGE_DESCRIPTION_PROCESSING_LIMIT: usize = 16;
+/// Default sampling temperature for image-describe when the vision
+/// model's config leaves `temperature` unset.
+///
+/// Prefer `[model.<id>].temperature` (or `[models].temperature`) when
+/// set — some providers (e.g. Kimi K3) reject any value other than a
+/// fixed constant. See [`crate::agent::config::finalize_image_describe_sampler_config`].
+pub(crate) const IMAGE_DESCRIBE_DEFAULT_TEMPERATURE: f32 = 0.2;
 /// Placeholder stamped on images that fall outside
 /// [`IMAGE_DESCRIPTION_PROCESSING_LIMIT`].
 pub(crate) const SKIPPED_IMAGE_MARKER: &str = "[skipped-due-to-limit]";
@@ -459,9 +466,13 @@ pub(crate) async fn describe_user_images(
             });
         }
     }
+    // Leave temperature unset on the request so SamplingClient applies
+    // SamplerConfig.temperature (model config, or
+    // IMAGE_DESCRIBE_DEFAULT_TEMPERATURE filled in by
+    // finalize_image_describe_sampler_config). Hardcoding here would
+    // override provider-specific values (e.g. Kimi K3 requires 1.0).
     let request = ConversationRequest::from_items(vec![user_item])
         .with_model(model)
-        .with_temperature(0.2)
         .with_max_output_tokens(4_096);
     const DESCRIBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(240);
     let response = tokio::time::timeout(DESCRIBE_TIMEOUT, client.conversation_collect(request))
@@ -525,7 +536,225 @@ pub(crate) fn persist_and_prepend_image_files(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::State;
+    use axum::response::sse::{Event, Sse};
+    use axum::routing::post;
+    use futures::stream;
+    use std::convert::Infallible;
+    use std::sync::Arc;
     use xai_grok_sampling_types::conversation::{ConversationItem, UserItem};
+
+    #[tokio::test]
+    async fn describe_cache_sends_image_once_and_returns_text() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let app = axum::Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(
+                    |State(requests): State<Arc<std::sync::Mutex<Vec<serde_json::Value>>>>,
+                     axum::Json(body): axum::Json<serde_json::Value>| async move {
+                        requests.lock().unwrap().push(body);
+                        Sse::new(stream::iter([
+                            Ok::<_, Infallible>(
+                                Event::default().data(
+                                    serde_json::json!({
+                                    "id": "chatcmpl-image-test",
+                                    "object": "chat.completion.chunk",
+                                    "created": 1,
+                                    "model": "vision-helper",
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {
+                                            "role": "assistant",
+                                            "content": "A red square."
+                                        },
+                                        "finish_reason": "stop"
+                                    }]
+                                    })
+                                    .to_string(),
+                                ),
+                            ),
+                            Ok(Event::default().data("[DONE]")),
+                        ]))
+                    },
+                ),
+            )
+            .with_state(requests.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = xai_grok_sampler::SamplingClient::new(xai_grok_sampler::SamplerConfig {
+            api_key: Some("test-key".into()),
+            base_url,
+            model: "vision-helper".into(),
+            max_completion_tokens: Some(4_096),
+            temperature: Some(0.2),
+            top_p: None,
+            api_backend: xai_grok_sampling_types::ApiBackend::ChatCompletions,
+            auth_scheme: Default::default(),
+            extra_headers: Default::default(),
+            extra_response_includes: Vec::new(),
+            query_params: Default::default(),
+            env_http_headers: Default::default(),
+            context_window: 32_768,
+            force_http1: false,
+            max_retries: None,
+            stream_tool_calls: false,
+            idle_timeout_secs: None,
+            reasoning_effort: None,
+            origin_client: None,
+            client_identifier: None,
+            deployment_id: None,
+            user_id: None,
+            client_version: None,
+            attribution_callback: None,
+            bearer_resolver: None,
+            supports_backend_search: false,
+            compactions_remaining: None,
+            compaction_at_tokens: None,
+            doom_loop_recovery: None,
+            header_injector: None,
+        })
+        .unwrap();
+        let cache = ImageDescribeCache::new();
+        for _ in 0..2 {
+            let description = cache
+                .get_or_describe(
+                    client.clone(),
+                    "vision-helper",
+                    b"image-bytes",
+                    "image/png",
+                    Some("Earlier user request"),
+                    "What is shown?",
+                    ImageDescribeSource::UserAttachment,
+                    "image-1",
+                )
+                .await
+                .unwrap();
+            assert_eq!(description, "A red square.");
+        }
+        server.abort();
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "identical describe requests must be cached"
+        );
+        let body = &requests[0];
+        let wire = body.to_string();
+        assert!(wire.contains("vision-helper"));
+        assert!(wire.contains("Earlier user request"));
+        assert!(wire.contains("data:image/png;base64,"));
+        assert!(wire.contains("image_url"));
+        // Client defaults (model config) must flow to the wire when the
+        // describe request leaves temperature unset.
+        let temp = body
+            .get("temperature")
+            .and_then(|v| v.as_f64())
+            .expect("temperature from SamplingClient defaults");
+        assert!(
+            (temp - 0.2).abs() < 1e-6,
+            "expected client default temperature 0.2, got {temp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn describe_uses_model_configured_temperature_not_hardcoded() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let app = axum::Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(
+                    |State(requests): State<Arc<std::sync::Mutex<Vec<serde_json::Value>>>>,
+                     axum::Json(body): axum::Json<serde_json::Value>| async move {
+                        requests.lock().unwrap().push(body);
+                        Sse::new(stream::iter([
+                            Ok::<_, Infallible>(
+                                Event::default().data(
+                                    serde_json::json!({
+                                    "id": "chatcmpl-image-temp",
+                                    "object": "chat.completion.chunk",
+                                    "created": 1,
+                                    "model": "kimi-k3",
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {
+                                            "role": "assistant",
+                                            "content": "A blue circle."
+                                        },
+                                        "finish_reason": "stop"
+                                    }]
+                                    })
+                                    .to_string(),
+                                ),
+                            ),
+                            Ok(Event::default().data("[DONE]")),
+                        ]))
+                    },
+                ),
+            )
+            .with_state(requests.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = xai_grok_sampler::SamplingClient::new(xai_grok_sampler::SamplerConfig {
+            api_key: Some("test-key".into()),
+            base_url,
+            model: "kimi-k3".into(),
+            max_completion_tokens: Some(4_096),
+            // Provider-fixed temperature (e.g. Kimi K3) must not be
+            // overridden by a request-level hardcode.
+            temperature: Some(1.0),
+            top_p: None,
+            api_backend: xai_grok_sampling_types::ApiBackend::ChatCompletions,
+            auth_scheme: Default::default(),
+            extra_headers: Default::default(),
+            extra_response_includes: Vec::new(),
+            query_params: Default::default(),
+            env_http_headers: Default::default(),
+            context_window: 32_768,
+            force_http1: false,
+            max_retries: None,
+            stream_tool_calls: false,
+            idle_timeout_secs: None,
+            reasoning_effort: None,
+            origin_client: None,
+            client_identifier: None,
+            deployment_id: None,
+            user_id: None,
+            client_version: None,
+            attribution_callback: None,
+            bearer_resolver: None,
+            supports_backend_search: false,
+            compactions_remaining: None,
+            compaction_at_tokens: None,
+            doom_loop_recovery: None,
+            header_injector: None,
+        })
+        .unwrap();
+        let description = describe_user_images(
+            client,
+            "kimi-k3",
+            "describe".into(),
+            &["data:image/png;base64,aa".into()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(description, "A blue circle.");
+        server.abort();
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let temp = requests[0]
+            .get("temperature")
+            .and_then(|v| v.as_f64())
+            .expect("temperature present");
+        assert!(
+            (temp - 1.0).abs() < 1e-6,
+            "model-configured temperature must be used, got {temp}"
+        );
+    }
     #[test]
     fn persist_and_prepend_image_files_writes_assets_and_lists_paths() {
         let dir = tempfile::tempdir().unwrap();
