@@ -268,6 +268,8 @@ $GROK_HOME/config.toml
 
 ## 7. 配置 BYOK 模型与图片理解
 
+### 7.1 通用 BYOK 模板
+
 下面是一份隔离测试配置模板。示例 URL 和模型 ID 必须替换为实际供应商值。
 
 ```toml
@@ -332,6 +334,87 @@ export VISION_MODEL_API_KEY="..."
 - 会话历史已经包含用户图片时切换到纯文本模型：下一次采样以 `TEXT_MODEL_HISTORY_CONTAINS_IMAGES` 阻止；切回视觉模型或新建会话。
 
 更完整的设计背景见 [BYOK 图片理解研究](../research/byok-image-understanding.md)。
+
+### 7.2 接入 OpenCode Go
+
+[OpenCode Go](https://opencode.ai/docs/go/) 提供 OpenAI Chat Completions、OpenAI Responses 和 Anthropic Messages 三种兼容接口。当前 fork 原生支持这三种 `api_backend`，因此可以通过用户配置直接接入，不需要修改代码。
+
+先在 OpenCode TUI 中运行 `/connect` 并选择 **OpenCode Go**，按提示订阅或登录后复制 API key。也可以从 OpenCode Go 控制台取得现有 key。不要把 key 直接写入 TOML；在启动 Grok 的同一个 shell 中设置：
+
+```bash
+export OPENCODE_API_KEY="..."
+```
+
+下面以 Grok 4.5 为默认模型。把配置写入 `$GROK_HOME/config.toml`；未设置 `GROK_HOME` 时就是 `~/.grok/config.toml`。
+
+```toml
+[models]
+default = "opencode-go-grok-4.5"
+
+[model."opencode-go-grok-4.5"]
+model = "grok-4.5"
+name = "OpenCode Go / Grok 4.5"
+base_url = "https://opencode.ai/zen/go/v1"
+env_key = "OPENCODE_API_KEY"
+api_backend = "chat_completions"
+context_window = 500000
+accepts_images = true
+```
+
+`base_url` 必须停在 `/v1`。Grok 会根据 `api_backend` 自动追加 `/chat/completions`、`/responses` 或 `/messages`；不要把完整 endpoint 写进 `base_url`。
+
+先确认配置已被解析且没有 `Config Warnings`：
+
+```bash
+GROK_HOME="$FORK_GROK_HOME" "$FORK_GROK" inspect
+```
+
+再通过模型目录 key 做一次最小连通性测试：
+
+```bash
+GROK_HOME="$FORK_GROK_HOME" \
+  "$FORK_GROK" -m opencode-go-grok-4.5 \
+  -p "只回复 OPENCODE_GO_OK"
+```
+
+返回 `401` 时先检查 `OPENCODE_API_KEY` 是否在启动 Grok 的同一个 shell 中非空；返回 `404` 或 endpoint 错误时检查 `model`、`base_url` 和 `api_backend` 是否匹配。
+
+OpenCode Go 的模型集合会变化。以下是接入时常用模型的配置值；以 [OpenCode Go endpoint 列表](https://opencode.ai/docs/go/#endpoints) 和实时 [`/v1/models`](https://opencode.ai/zen/go/v1/models) 响应为准。
+
+| 模型 | `model` | `api_backend` | `context_window` | `accepts_images` |
+|---|---|---|---:|---|
+| Grok 4.5 | `grok-4.5` | `chat_completions` | 500000 | `true` |
+| GPT 5.6 Luna | `gpt-5.6-luna` | `responses` | 1050000 | `true` |
+| GLM-5.2 | `glm-5.2` | `chat_completions` | 1000000 | `false` |
+| Kimi K3 | `kimi-k3` | `chat_completions` | 1048576 | `true` |
+| MiniMax M3 | `minimax-m3` | `messages` | 1000000 | `false` |
+| Qwen3.8 Max | `qwen3.8-max` | `messages` | 1000000 | `false` |
+
+例如，要同时加入 GPT 5.6 Luna：
+
+```toml
+[model."opencode-go-gpt-5.6-luna"]
+model = "gpt-5.6-luna"
+name = "OpenCode Go / GPT 5.6 Luna"
+base_url = "https://opencode.ai/zen/go/v1"
+env_key = "OPENCODE_API_KEY"
+api_backend = "responses"
+context_window = 1050000
+accepts_images = true
+```
+
+启动时切换模型：
+
+```bash
+GROK_HOME="$FORK_GROK_HOME" \
+  "$FORK_GROK" -m opencode-go-gpt-5.6-luna
+```
+
+需要特别区分两个 ID：OpenCode 自己的模型选择器使用 `opencode-go/<model-id>`，例如 `opencode-go/grok-4.5`；Grok 直接调用 OpenCode Go API 时，`model` 字段必须使用供应商接收的原始 ID `grok-4.5`。`[model."..."]` 中的名字只是 Grok 本地目录 key，可以自行命名。
+
+如果本地目录 key 包含 `.`，TOML section 必须加引号。例如 `[model."opencode-go-grok-4.5"]` 是一个模型条目；不加引号的 `[model.opencode-go-grok-4.5]` 会被 TOML 解析成嵌套表，并在 `inspect` 中产生 `unknown field` 警告。
+
+OpenCode Go 接入的是模型推理接口。切换 `base_url` 不会自动获得 xAI 专有的 X Search、服务端 Web Search、文件、语音或图像生成能力；这些能力仍取决于目标 endpoint 是否实现 Grok 当前使用的对应协议。
 
 ## 8. 验证实际加载结果
 
